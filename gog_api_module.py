@@ -20,6 +20,8 @@ from http.client import BadStatusLine
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, HTTPError, URLError, build_opener, Request
 import psycopg2
+import requests
+from bs4 import BeautifulSoup
 
 
 # благодарим за возможность подключить GOG вот эту программу для скачивания игр
@@ -111,6 +113,7 @@ def request(url, args=None, byte_range=None, retries=HTTP_RETRY_COUNT, delay=HTT
 # --------------------------
 # Дополнительные типы и функции
 # --------------------------
+
 class AttrDict(dict):
     def __init__(self, **kw):
         self.update(kw)
@@ -142,6 +145,7 @@ def process_argv(argv):
 # --------
 # Команды
 # --------
+
 def cmd_login(user, passwd):
     # Логинимся в GOG
     login_data = {'user': user,
@@ -153,7 +157,7 @@ def cmd_login(user, passwd):
                   'two_step_security_code': None,
                   'login_success': False,
                   }
-    
+
     global_cookies.clear()
 
     # просим логин/пароль по необходимости
@@ -175,7 +179,7 @@ def cmd_login(user, passwd):
     # обрабатываем токен логина
     with request(login_data['auth_url'], delay=0) as page:
         etree = html5lib.parse(page, namespaceHTMLElements=False)
-        # расстраиваемся, если получаем требование ввода капчи 
+        # расстраиваемся, если получаем требование ввода капчи
         if len(etree.findall('.//div[@class="g-recaptcha form__recaptcha"]')) > 0:
             error("невозможно продолжить, GOG требует ввод reCAPTCHA")
             return
@@ -232,15 +236,12 @@ def cmd_update():
     # получаем данные игр
     done = False
     info('подключение к базе')
-    conn = psycopg2.connect(dbname='game_shelf', user='pacas', password='12345', host='127.0.0.1', port = '5432', connect_timeout=5)
+    conn = psycopg2.connect(dbname='game_shelf', user='pacas', password='12345', host='127.0.0.1', port='5432', connect_timeout=5)
     cursor = conn.cursor()
     info('подключено')
     while not done:
         i += 1
-        if i == 1:
-            info('получение данных (страница %d)...' % i)
-        else:
-            info('получение данных (страница %d / %d)...' % (i, json_data['totalPages']))
+        info('получение данных (страница %d)...' % i)
 
         url = api_url + "?" + urlencode({'mediaType': media_type,
                                          'sortBy': 'title',
@@ -263,39 +264,81 @@ def cmd_update():
                 item.long_title = item_json_data['title']
                 item.genre = item_json_data['category']
                 item.image_url = item_json_data['image']
-                
+                item.store_url = item_json_data['url']
+
+                if item.store_url[0:5] == '/game/':
+                    check = 1
+                    item.store_url = GOG_HOME_URL + item.store_url
+                    response = requests.get(item.store_url)
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    full_list = soup.find_all(class_='details__content table__row-content')
+                    found = str(full_list[3])
+                    c = [i for i in range(len(found)) if found.startswith('}" href="/games?devpub=', i)]
+                    a = found.find("eventLabel: 'Developer: ")
+                    b = found.find("eventLabel: 'Publisher: ")
+                    dev = str(found[a + 24:c[0] - 1])
+                    pub = str(found[b + 24:c[1] - 1])
+
+                    # проверяем существование разрабов, иначе создаём
+                    cursor.execute("SELECT EXISTS(SELECT name FROM companies WHERE name = '" + dev + "')")
+                    records = cursor.fetchall()
+                    if str(records[0][0]) == 'False':
+                        cursor.callproc('insert_company', [dev, None, None])
+
+                    # проверяем существование издателей, иначе создаём
+                    cursor.execute("SELECT EXISTS(SELECT name FROM companies WHERE name = '" + pub + "')")
+                    records = cursor.fetchall()
+                    if str(records[0][0]) == 'False':
+                        cursor.callproc('insert_company', [pub, None, None])
+                else:
+                    check = 0
+
                 # проверяем существование жанра, иначе создаём
-                cursor.execute("SELECT EXISTS(SELECT name FROM genres WHERE name = '"+ item.genre +"')")
+                cursor.execute("SELECT EXISTS(SELECT name FROM genres WHERE name = '" + item.genre + "')")
                 records = cursor.fetchall()
                 # info('жанр существует - %s' % records[0][0])
                 if str(records[0][0]) == 'False':
                     # info('добавляем жанр %s' % item.genre)
                     cursor.callproc('insert_genre', [item.genre, None])
-                
-                
+
                 addapi_url = GOG_API_URL
                 addapi_url += "/" + str(item.id) + "?expand=expanded_dlcs,description,screenshots,videos"
                 try:
                     with request(addapi_url) as data_request:
                         reader = codecs.getreader("utf-8")
                         item_json_data_additional = json.load(reader(data_request))
-        
+
                         item.release_date = item_json_data_additional['release_date']
                         item.description = item_json_data_additional['description']
                         item.description = item.description['lead']
-                
+
                 except Exception:
                     log_exception('error')
-                    
+
                 # добавляем игру
                 info('добавляем игру %s' % item.long_title)
-                cursor.callproc('insert_game',[item.long_title, item.release_date, item.description, item.image_url[2:]+'.png'])
+                cursor.callproc('insert_game', [item.long_title, item.release_date, item.description, item.image_url[2:] + '.png'])
                 gameid = cursor.fetchall()
                 # info('%s - полученный id' % gameid[0][0])
-                        
+
                 # соединяем игру и жанр
-                cursor.callproc('attach_game_genre',[gameid[0][0], item.genre])
-                
+                cursor.callproc('attach_game_genre', [gameid[0][0], item.genre])
+
+                # соединяем игру и платформу
+                cursor.execute("SELECT id FROM platforms WHERE name = 'GOG.com'")
+                gogid = cursor.fetchall()
+                cursor.callproc('attach_game_platform', [gameid[0][0], gogid[0][0], item.store_url, str(item.id)])
+
+                if check == 1:
+                    # соединяем игру и разрабов
+                    cursor.callproc('attach_game_developer', [gameid[0][0], dev])
+
+                    # соединяем игру и издателей
+                    cursor.callproc('attach_game_publisher', [gameid[0][0], pub])
+                else:
+                    cursor.callproc('attach_game_developer', [gameid[0][0], ''])
+                    cursor.callproc('attach_game_publisher', [gameid[0][0], ''])
+
                 items.append(item)
                 cursor.execute("COMMIT;")
 
@@ -313,6 +356,12 @@ def cmd_update():
     # закрываем соединение
     cursor.close()
     conn.close()
+
+    '''
+    Полезные ссылки:
+        embed.gog.com/userData.json - инфа с id пользователя
+        embed.gog.com/users/info/48628349971017?expand=friendStatus,wishlistStatus,blockedStatus
+    '''
 
 
 def main(args):
