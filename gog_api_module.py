@@ -263,7 +263,7 @@ def cmd_update():
                 item.id = item_json_data['id']
                 item.long_title = item_json_data['title']
                 item.genre = item_json_data['category']
-                item.image_url = item_json_data['image']
+                # item.image_url = item_json_data['image']
                 item.store_url = item_json_data['url']
 
                 if item.store_url[0:5] == '/game/':
@@ -308,6 +308,10 @@ def cmd_update():
                         reader = codecs.getreader("utf-8")
                         item_json_data_additional = json.load(reader(data_request))
 
+                        item.image = item_json_data_additional['images']
+                        item.image = item.images['logo2x']
+                        item.image.replace('\/', '/')
+                        item.image = item.images[2:]
                         item.release_date = item_json_data_additional['release_date']
                         item.description = item_json_data_additional['description']
                         item.description = item.description['lead']
@@ -317,7 +321,7 @@ def cmd_update():
 
                 # добавляем игру
                 info('добавляем игру %s' % item.long_title)
-                cursor.callproc('insert_game', [item.long_title, item.release_date, item.description, item.image_url[2:] + '.png'])
+                cursor.callproc('insert_game', [item.long_title, item.release_date, item.description, item.image])
                 gameid = cursor.fetchall()
                 # info('%s - полученный id' % gameid[0][0])
 
